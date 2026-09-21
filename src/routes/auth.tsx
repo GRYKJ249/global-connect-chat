@@ -1,20 +1,40 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
-import { ArrowRight, Loader2, Phone, ShieldCheck, UserRound } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useServerFn } from "@tanstack/react-start";
+import {
+  ArrowRight,
+  Camera,
+  Check,
+  ChevronDown,
+  Loader2,
+  Phone,
+  Search,
+  ShieldCheck,
+  UserRound,
+} from "lucide-react";
 import { toast } from "sonner";
 import { OperaLogoMark } from "@/components/brand/OperaLogoMark";
+import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
 import { useLang } from "@/lib/i18n";
+import { COUNTRIES, DEFAULT_COUNTRY, type Country } from "@/lib/countries";
+import { requestPhoneCode, verifyPhoneCode } from "@/lib/auth-otp.functions";
 
 export const Route = createFileRoute("/auth")({
   ssr: false,
   head: () => ({
     meta: [
       { title: "Sign in — Opera AI" },
-      { name: "description", content: "Sign in to Opera AI with your phone number and a one-time SMS code." },
+      {
+        name: "description",
+        content: "Create your Opera AI account with your phone number and a WhatsApp code.",
+      },
       { property: "og:title", content: "Sign in — Opera AI" },
-      { property: "og:description", content: "Sign in to Opera AI with your phone number and a one-time SMS code." },
+      {
+        property: "og:description",
+        content: "Create your Opera AI account with your phone number and a WhatsApp code.",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
     ],
@@ -24,30 +44,118 @@ export const Route = createFileRoute("/auth")({
 
 type Step = "phone" | "code" | "profile";
 
-function normalizePhone(value: string) {
-  const digits = value.replace(/[^\d+]/g, "");
-  return digits.startsWith("+") ? digits : `+${digits}`;
+function CountryPicker({
+  value,
+  onChange,
+}: {
+  value: Country;
+  onChange: (country: Country) => void;
+}) {
+  const { t, lang } = useLang();
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+
+  const results = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return COUNTRIES;
+    return COUNTRIES.filter(
+      (country) =>
+        country.en.toLowerCase().includes(needle) ||
+        country.ar.includes(needle) ||
+        country.dial.includes(needle) ||
+        country.code.toLowerCase() === needle,
+    );
+  }, [query]);
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        className="glass flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-sm"
+      >
+        <span className="text-base">{value.flag}</span>
+        <span className="flex-1 truncate text-start">{lang === "ar" ? value.ar : value.en}</span>
+        <span dir="ltr" className="text-muted-foreground">
+          {value.dial}
+        </span>
+        <ChevronDown className="h-4 w-4 text-muted-foreground" />
+      </button>
+
+      {open && (
+        <div className="glass-strong absolute z-50 mt-2 max-h-72 w-full overflow-hidden rounded-xl">
+          <div className="flex items-center gap-2 border-b border-border/40 px-3 py-2">
+            <Search className="h-4 w-4 text-muted-foreground" />
+            <input
+              autoFocus
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder={t("Search country", "ابحث عن دولة")}
+              className="w-full bg-transparent text-sm outline-none"
+            />
+          </div>
+          <ul className="max-h-60 overflow-y-auto py-1">
+            {results.map((country) => (
+              <li key={country.code}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onChange(country);
+                    setOpen(false);
+                    setQuery("");
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-foreground/5"
+                >
+                  <span className="text-base">{country.flag}</span>
+                  <span className="flex-1 truncate text-start">
+                    {lang === "ar" ? country.ar : country.en}
+                  </span>
+                  <span dir="ltr" className="text-muted-foreground">
+                    {country.dial}
+                  </span>
+                  {country.code === value.code && <Check className="h-4 w-4 text-primary" />}
+                </button>
+              </li>
+            ))}
+            {results.length === 0 && (
+              <li className="px-3 py-3 text-center text-sm text-muted-foreground">
+                {t("No country found", "ما في دولة بهذا الاسم")}
+              </li>
+            )}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function AuthPage() {
   const { t, lang } = useLang();
   const { user, loading } = useAuth();
   const navigate = useNavigate();
+  const sendCodeFn = useServerFn(requestPhoneCode);
+  const verifyCodeFn = useServerFn(verifyPhoneCode);
 
   const [step, setStep] = useState<Step>("phone");
+  const [country, setCountry] = useState<Country>(DEFAULT_COUNTRY);
+  const [localNumber, setLocalNumber] = useState("");
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
+  const [previewCode, setPreviewCode] = useState<string | null>(null);
   const [displayName, setDisplayName] = useState("");
   const [username, setUsername] = useState("");
+  const [avatarPath, setAvatarPath] = useState<string | null>(null);
+  const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Already signed in: go to the profile step if it is incomplete, otherwise to chat.
+  // Already signed in: finish the profile if it is incomplete, otherwise go to chat.
   useEffect(() => {
     if (loading || !user) return;
     void (async () => {
       const { data } = await supabase
         .from("profiles")
-        .select("username, display_name")
+        .select("username, display_name, avatar_url")
         .eq("id", user.id)
         .maybeSingle();
       if (data?.username) {
@@ -59,63 +167,147 @@ function AuthPage() {
     })();
   }, [loading, user, navigate]);
 
+  const fullPhone = `${country.dial}${localNumber.replace(/\D/g, "")}`;
+
   const sendCode = async () => {
-    const value = normalizePhone(phone);
-    if (value.length < 8) {
-      toast.error(t("Enter a valid phone number with country code.", "اكتب رقم هاتف صحيح مع رمز الدولة."));
+    if (localNumber.replace(/\D/g, "").length < 6) {
+      toast.error(t("Enter your phone number.", "اكتب رقم هاتفك."));
       return;
     }
     setBusy(true);
-    const { error } = await supabase.auth.signInWithOtp({ phone: value });
-    setBusy(false);
-    if (error) {
-      toast.error(error.message);
-      return;
+    try {
+      const result = await sendCodeFn({
+        data: { phone: fullPhone, countryCode: country.code },
+      });
+      if (!result.ok) {
+        const messages: Record<string, string> = {
+          country_unavailable: t("Sign-up is not available for this country.", "التسجيل غير متاح لهذه الدولة."),
+          too_many_requests: t("Too many codes requested. Try again later.", "طلبت أكواد كثيرة. جرب بعد شوية."),
+          send_failed: t("We couldn't send the code. Try again.", "ما قدرنا نرسل الكود. جرب تاني."),
+          server_error: t("Something went wrong. Try again.", "حصل خطأ. جرب تاني."),
+        };
+        toast.error(messages[result.error] ?? messages["server_error"]!);
+        return;
+      }
+      setPhone(fullPhone);
+      setPreviewCode("code" in result ? (result.code ?? null) : null);
+      setCode("");
+      setStep("code");
+      toast.success(t("Code sent on WhatsApp.", "تم إرسال الكود على واتساب."));
+    } catch (error) {
+      console.error(error);
+      toast.error(t("Something went wrong. Try again.", "حصل خطأ. جرب تاني."));
+    } finally {
+      setBusy(false);
     }
-    setPhone(value);
-    setStep("code");
-    toast.success(t("Code sent by SMS.", "تم إرسال الكود برسالة نصية."));
   };
 
-  const verify = async () => {
+  const verify = async (value: string) => {
     setBusy(true);
-    const { error } = await supabase.auth.verifyOtp({ phone, token: code.trim(), type: "sms" });
-    setBusy(false);
-    if (error) {
-      toast.error(error.message);
-      return;
+    try {
+      const result = await verifyCodeFn({ data: { phone, code: value } });
+      if (!result.ok) {
+        const messages: Record<string, string> = {
+          expired: t("That code expired. Ask for a new one.", "الكود انتهى. اطلب كود جديد."),
+          wrong_code: t("Wrong code. Check and try again.", "الكود غلط. راجعه وجرب تاني."),
+          too_many_attempts: t("Too many tries. Ask for a new code.", "محاولات كثيرة. اطلب كود جديد."),
+          server_error: t("Something went wrong. Try again.", "حصل خطأ. جرب تاني."),
+        };
+        toast.error(messages[result.error] ?? messages["server_error"]!);
+        setCode("");
+        return;
+      }
+      const { error } = await supabase.auth.signInWithPassword({
+        email: result.email,
+        password: result.password,
+      });
+      if (error) {
+        toast.error(error.message);
+        return;
+      }
+      setPreviewCode(null);
+      setStep("profile");
+    } catch (error) {
+      console.error(error);
+      toast.error(t("Something went wrong. Try again.", "حصل خطأ. جرب تاني."));
+    } finally {
+      setBusy(false);
     }
-    setStep("profile");
   };
 
-  const saveProfile = async () => {
-    const handle = username.trim().replace(/^@/, "");
-    if (!displayName.trim() || !handle) {
-      toast.error(t("Add your name and a username.", "أضف اسمك واسم المستخدم."));
+  const pickAvatar = async (file: File) => {
+    if (!file.type.startsWith("image/")) {
+      toast.error(t("Pick an image file.", "اختر ملف صورة."));
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error(t("Pick an image under 5 MB.", "اختر صورة أقل من 5 ميجا."));
       return;
     }
     const { data: current } = await supabase.auth.getUser();
     if (!current.user) return;
 
     setBusy(true);
-    const { error } = await supabase
-      .from("profiles")
-      .upsert({
-        id: current.user.id,
-        display_name: displayName.trim(),
-        username: handle,
-        phone: current.user.phone ?? phone,
-      });
+    const extension = file.name.split(".").pop()?.toLowerCase() ?? "jpg";
+    const path = `${current.user.id}/avatar-${Date.now()}.${extension}`;
+    const { error } = await supabase.storage
+      .from("avatars")
+      .upload(path, file, { upsert: true, contentType: file.type });
+    if (error) {
+      setBusy(false);
+      toast.error(error.message);
+      return;
+    }
+    const { data: signed } = await supabase.storage.from("avatars").createSignedUrl(path, 60 * 60);
+    setAvatarPath(path);
+    setAvatarPreview(signed?.signedUrl ?? null);
+    setBusy(false);
+  };
+
+  const saveProfile = async () => {
+    const handle = username.trim().replace(/^@/, "").toLowerCase();
+    if (!displayName.trim() || !handle) {
+      toast.error(t("Add your name and a username.", "أضف اسمك واسم المستخدم."));
+      return;
+    }
+    if (!/^[a-z0-9_.]{3,24}$/.test(handle)) {
+      toast.error(
+        t(
+          "Usernames use 3-24 letters, numbers, dots or underscores.",
+          "اسم المستخدم من 3 إلى 24 حرف أو رقم أو نقطة أو شرطة سفلية.",
+        ),
+      );
+      return;
+    }
+    const { data: current } = await supabase.auth.getUser();
+    if (!current.user) return;
+
+    setBusy(true);
+    const { error } = await supabase.from("profiles").upsert({
+      id: current.user.id,
+      display_name: displayName.trim(),
+      username: handle,
+      phone: phone || (current.user.user_metadata?.["phone"] as string | undefined) || null,
+      country_code: country.code,
+      ...(avatarPath ? { avatar_url: avatarPath } : {}),
+    });
     setBusy(false);
     if (error) {
-      toast.error(error.message.includes("duplicate") ? t("That username is taken.", "اسم المستخدم محجوز.") : error.message);
+      toast.error(
+        error.message.includes("duplicate")
+          ? t("That username is taken.", "اسم المستخدم محجوز.")
+          : error.message,
+      );
       return;
     }
     navigate({ to: "/chat", replace: true });
   };
 
   return (
-    <div dir={lang === "ar" ? "rtl" : "ltr"} className="flex min-h-screen items-center justify-center px-4">
+    <div
+      dir={lang === "ar" ? "rtl" : "ltr"}
+      className="flex min-h-screen items-center justify-center px-4 py-10"
+    >
       <div className="glass-strong w-full max-w-md rounded-3xl p-8">
         <Link to="/" className="flex items-center justify-center gap-2.5">
           <OperaLogoMark className="h-9 w-9" />
@@ -136,19 +328,27 @@ function AuthPage() {
               {t("Sign in with your phone", "سجّل دخولك برقم هاتفك")}
             </h1>
             <p className="text-center text-sm text-muted-foreground">
-              {t("We'll text you a one-time code.", "راح نرسل ليك كود لمرة واحدة.")}
+              {t("We'll send a code on WhatsApp.", "راح نرسل ليك كود على واتساب.")}
             </p>
+
+            <CountryPicker value={country} onChange={setCountry} />
+
             <label className="glass flex items-center gap-2 rounded-xl px-3 py-2.5">
               <Phone className="h-4 w-4 text-primary" />
+              <span dir="ltr" className="text-sm text-muted-foreground">
+                {country.dial}
+              </span>
               <input
-                value={phone}
-                onChange={(event) => setPhone(event.target.value)}
+                value={localNumber}
+                onChange={(event) => setLocalNumber(event.target.value)}
                 dir="ltr"
                 inputMode="tel"
-                placeholder="+249901234567"
+                autoComplete="tel-national"
+                placeholder="901234567"
                 className="flex-1 bg-transparent text-sm outline-none"
               />
             </label>
+
             <button type="submit" disabled={busy} className="btn-hero w-full justify-center !py-2.5 text-sm">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
               {t("Send code", "أرسل الكود")}
@@ -160,7 +360,7 @@ function AuthPage() {
           <form
             onSubmit={(event) => {
               event.preventDefault();
-              void verify();
+              void verify(code);
             }}
             className="mt-7 space-y-4"
           >
@@ -168,24 +368,48 @@ function AuthPage() {
             <p className="text-center text-sm text-muted-foreground" dir="ltr">
               {phone}
             </p>
-            <label className="glass flex items-center gap-2 rounded-xl px-3 py-2.5">
-              <ShieldCheck className="h-4 w-4 text-primary" />
-              <input
+
+            <div className="flex justify-center" dir="ltr">
+              <InputOTP
+                maxLength={6}
                 value={code}
-                onChange={(event) => setCode(event.target.value)}
-                dir="ltr"
-                inputMode="numeric"
-                placeholder="123456"
-                className="flex-1 bg-transparent text-center text-lg tracking-[0.4em] outline-none"
-              />
-            </label>
+                onChange={(next) => {
+                  setCode(next);
+                  if (next.length === 6 && !busy) void verify(next);
+                }}
+              >
+                <InputOTPGroup className="gap-2">
+                  {[0, 1, 2, 3, 4, 5].map((index) => (
+                    <InputOTPSlot
+                      key={index}
+                      index={index}
+                      className="glass h-12 w-11 rounded-xl border-border/60 text-lg font-semibold first:rounded-xl last:rounded-xl"
+                    />
+                  ))}
+                </InputOTPGroup>
+              </InputOTP>
+            </div>
+
+            {previewCode && (
+              <p className="rounded-xl bg-primary/10 px-3 py-2 text-center text-xs text-muted-foreground">
+                {t("WhatsApp sending is not connected yet — your code is", "إرسال واتساب غير موصول بعد — كودك هو")}{" "}
+                <span dir="ltr" className="font-semibold text-foreground">
+                  {previewCode}
+                </span>
+              </p>
+            )}
+
             <button type="submit" disabled={busy} className="btn-hero w-full justify-center !py-2.5 text-sm">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
               {t("Verify", "تأكيد")}
             </button>
             <button
               type="button"
-              onClick={() => setStep("phone")}
+              onClick={() => {
+                setStep("phone");
+                setPreviewCode(null);
+                setCode("");
+              }}
               className="btn-ghost w-full justify-center !py-2 text-xs"
             >
               {t("Change number", "تغيير الرقم")}
@@ -203,13 +427,49 @@ function AuthPage() {
           >
             <h1 className="text-center font-display text-xl font-bold">{t("Your profile", "ملفك الشخصي")}</h1>
             <p className="text-center text-sm text-muted-foreground">
-              {t("Pick the name and username people will see.", "اختر الاسم واسم المستخدم الظاهر للناس.")}
+              {t("Add a picture, your name and a username.", "أضف صورة واسمك واسم المستخدم.")}
             </p>
+
+            <div className="flex flex-col items-center gap-2">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="relative h-24 w-24 overflow-hidden rounded-full border border-border/60 bg-foreground/5"
+              >
+                {avatarPreview ? (
+                  <img src={avatarPreview} alt="" className="h-full w-full object-cover" />
+                ) : (
+                  <span className="flex h-full w-full items-center justify-center">
+                    <Camera className="h-6 w-6 text-muted-foreground" />
+                  </span>
+                )}
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (file) void pickAvatar(file);
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="btn-ghost !py-1.5 text-xs"
+              >
+                {t("Choose from gallery", "اختر من المعرض")}
+              </button>
+            </div>
+
             <label className="glass flex items-center gap-2 rounded-xl px-3 py-2.5">
               <UserRound className="h-4 w-4 text-primary" />
               <input
                 value={displayName}
                 onChange={(event) => setDisplayName(event.target.value)}
+                maxLength={60}
                 placeholder={t("Display name", "الاسم الظاهر")}
                 className="flex-1 bg-transparent text-sm outline-none"
               />
@@ -220,10 +480,12 @@ function AuthPage() {
                 value={username}
                 onChange={(event) => setUsername(event.target.value)}
                 dir="ltr"
+                maxLength={24}
                 placeholder="username"
                 className="flex-1 bg-transparent text-sm outline-none"
               />
             </label>
+
             <button type="submit" disabled={busy} className="btn-hero w-full justify-center !py-2.5 text-sm">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
               {t("Save and continue", "احفظ وواصل")}
